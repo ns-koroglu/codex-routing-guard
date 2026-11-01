@@ -33,7 +33,10 @@ class RoutingTests(unittest.TestCase):
     def runtime(self,model='gpt-6.1-sol',effort='high',turn='turn-1',tail='',identity='destination',parent=None):
         path=self.root/(identity+'.jsonl')
         session={'id':identity,'source':{'subagent':{'thread_spawn':{'parent_thread_id':parent}}} if parent else 'vscode'}
-        events=[{'type':'session_meta','payload':session},{'type':'turn_context','timestamp':datetime.datetime.now(datetime.timezone.utc).isoformat(),'payload':{'turn_id':turn,'model':model,'effort':effort,'cwd':str(self.root)}}]
+        # Round the synthetic event upward: ISO microseconds must not precede a
+        # nanosecond-resolution reservation made in the same Windows clock tick.
+        stamp=datetime.datetime.fromtimestamp(time.time(),datetime.timezone.utc)+datetime.timedelta(microseconds=1)
+        events=[{'type':'session_meta','payload':session},{'type':'turn_context','timestamp':stamp.isoformat(),'payload':{'turn_id':turn,'model':model,'effort':effort,'cwd':str(self.root)}}]
         path.write_text('\n'.join(json.dumps(x) for x in events)+'\n'+tail);return path
 
     def verified(self):
