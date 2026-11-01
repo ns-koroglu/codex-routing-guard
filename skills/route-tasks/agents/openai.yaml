@@ -1,0 +1,4 @@
+interface:
+  display_name: "Task Routing"
+  short_description: "Route tasks with verified profiles and project context"
+  default_prompt: "Use $route-tasks to prepare and dispatch this task with a supported profile while preserving its project and existing work."

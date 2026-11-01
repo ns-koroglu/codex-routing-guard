@@ -1,0 +1,17 @@
+EXECUTION_MODE: ROUTED_WORK_V1
+The preflight ROUTING_CONTEXT binds the actual source, stable task/revision, selected profile, project/checkout and authorized phase. Execute this task here; verify current runtime/app evidence under CODEX_HOME/routing/POLICY.md (default ~/.codex/routing/POLICY.md). Do not recursively route this task. Preserve user overrides and existing work.
+
+Objective and context
+<Faithfully expand the request, relevant background/project paths, known facts, assumptions and material unknowns.>
+
+Deliverables and authority
+<Concrete working outcome/artifacts; authorized actions and limits. Distinguish audit-only/approval waiting from execution, and commit/push/merge/deploy/destructive actions/spending. Preserve edits and data.>
+
+Approach and integration
+<Smallest reliable approach through real entry points/interfaces; relevant security, validation, error handling and data integrity. Use original absolute input paths and resolved executionCwd.>
+
+Assignments
+<For meaningful multi-stage work: at most 3–5 scoped assignments with complete English task prompts, role, deliverables, constraints, dependencies, acceptance and explicit supported model/effort. Use actual nested agents when beneficial, one active and minimal context; otherwise state why none are needed.>
+
+Acceptance, review and delivery
+<Observable acceptance, smallest risk-appropriate checks, final intent/prompt/artifact review and execution evidence. Distinguish build/runtime/simulation/device/field acceptance. Record blockers, actual profiles, rollback and delivery status in a compact checkpoint. Economical-model work requires actual stronger final review. Concise result in the user's preferred language; no prompt echo.>
