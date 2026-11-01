@@ -1,6 +1,6 @@
 ---
 name: route-tasks
-description: "Operate the installed Codex routing v2 workflow: prepare execution prompts, choose supported profiles, dispatch tasks into the intended project, and reuse destinations for follow-ups. Use for task routing; an existing execution chat continues its task in place."
+description: "Route Codex tasks to verified project, checkout and model profiles; reuse destinations and optionally discover/review/install task-specific skills. Use for routing or capability gaps; an existing execution chat continues in place."
 ---
 
 # Route Tasks
@@ -9,7 +9,7 @@ Operate the existing routing installation through a thin adapter. Keep its imple
 
 ## Establish the context
 
-1. Run `python3 scripts/routing.py --status` relative to this skill directory. It resolves the runtime from the existing `CODEX_HOME`, or `~/.codex`, without changing either. If the router/policy is missing, explain the dependency and stop dispatching; this skill does not install hooks, services or account settings.
+1. Run `scripts/routing.py --status` with the available Python 3.9+ interpreter relative to this skill directory (`python`/`py -3` on Windows, typically `python3` on Linux/macOS). It resolves the runtime from the existing `CODEX_HOME`, or `~/.codex`, without changing either. If the router/policy is missing, explain the dependency and stop dispatching; this skill does not install hooks, services or account settings.
 2. Read the returned `policyPath` once for the relevant context. Read the returned operator reference only for the operation being performed. For dependency and portability boundaries, see [references/runtime.md](references/runtime.md).
 3. Distinguish fresh intake, an execution task, a related follow-up and a request to inspect/maintain the router. `EXECUTION_MODE: ROUTED_WORK_V1` executes in place. A follow-up/status/correction/stop uses the existing stable task and destination; it never starts a duplicate. An audit-only request remains read-only until actual user approval.
 
@@ -21,9 +21,13 @@ Use `scripts/routing.py` to forward the required command to the installed helper
 
 After asynchronous creation, attach the actual destination, verify its runtime profile, and observe a fresh app turn before announcing started. Preserve uncertain reservations and reconcile the original destination. Never substitute configured defaults, queue acceptance or a model named in a prompt for actual execution evidence.
 
-For genuinely multi-stage work, assign at most 3–5 meaningful scopes to actual nested agents when useful, one active by default, with explicit supported profiles and minimal context. Economical-model output needs actual stronger-model final review of the original intent, routed prompt and final result. Bind review and completion to the current task/revision and unchanged artifacts.
+For genuinely multi-stage work, use actual nested agents only when delegation is authorized by the user and host; keep scopes meaningful, one active by default, with supported profiles and minimal context. Economical-model output needs actual stronger-model final review of the original intent, routed prompt and final result. Bind review and completion to the current task/revision and unchanged artifacts. Missing reviewer access remains visible; never invent a receipt.
 
 Record stop/cancel as requested until the app confirms interruption. Keep approval waiting and terminal states intact. Recovery activation is a separate installed-product trust decision; creating or invoking this skill never satisfies it.
+
+## Fill a real capability gap
+
+Reuse the exposed installed skill/tool catalog first. If a specialist would materially improve the current task and none fits, read [references/skill-discovery.md](references/skill-discovery.md). Compare primary sources, task fit, maintenance, license and repository reputation; prefer high-star sources without equating popularity with safety. With existing user authorization, review and install the smallest useful skill at an immutable commit using the installed `skill_supply.py` helper. Preserve install boundaries and report actual activation/verification. No useful candidate or unavailable network is a reason to continue with existing capabilities, not to stop the original task.
 
 ## Deliver
 

@@ -33,7 +33,10 @@ class RoutingTests(unittest.TestCase):
     def runtime(self,model='gpt-6.1-sol',effort='high',turn='turn-1',tail='',identity='destination',parent=None):
         path=self.root/(identity+'.jsonl')
         session={'id':identity,'source':{'subagent':{'thread_spawn':{'parent_thread_id':parent}}} if parent else 'vscode'}
-        events=[{'type':'session_meta','payload':session},{'type':'turn_context','timestamp':datetime.datetime.now(datetime.timezone.utc).isoformat(),'payload':{'turn_id':turn,'model':model,'effort':effort,'cwd':str(self.root)}}]
+        # Round the synthetic event upward: ISO microseconds must not precede a
+        # nanosecond-resolution reservation made in the same Windows clock tick.
+        stamp=datetime.datetime.fromtimestamp(time.time(),datetime.timezone.utc)+datetime.timedelta(microseconds=1)
+        events=[{'type':'session_meta','payload':session},{'type':'turn_context','timestamp':stamp.isoformat(),'payload':{'turn_id':turn,'model':model,'effort':effort,'cwd':str(self.root)}}]
         path.write_text('\n'.join(json.dumps(x) for x in events)+'\n'+tail);return path
 
     def verified(self):
@@ -136,7 +139,7 @@ class RoutingTests(unittest.TestCase):
         project={'projectId':'p','projectKind':'local','path':str(self.root),'hostId':'local'}
         context=d.resolve_project([project],str(self.root));key=self.reserve(task='ancestor',context=context,projects=[project]);record=self.data[key]
         d.attach(record,'destination','local','p',self.data);path=self.runtime()
-        lines=[json.loads(x) for x in path.read_text().splitlines()];lines[-1]['payload']['cwd']='/';path.write_text('\n'.join(json.dumps(x) for x in lines)+'\n')
+        lines=[json.loads(x) for x in path.read_text(encoding='utf-8').splitlines()];lines[-1]['payload']['cwd']='/';path.write_text('\n'.join(json.dumps(x) for x in lines)+'\n')
         d.verify(record,path);self.assertEqual(record['status'],'blocked')
 
     def test_legacy_original_request_reuses_mapping_without_mutating_history(self):
@@ -255,7 +258,7 @@ class RoutingTests(unittest.TestCase):
         cmd=[sys.executable,str(Path(__file__).with_name('dispatch.py')),'--ledger',str(ledger),'preflight','--request',str(req),'--projects',str(projects),'--prompt',str(prompt),'--capabilities',str(caps),'--output',str(output)]
         subprocess.run(cmd,check=True,capture_output=True);before=ledger.read_bytes()
         self.assertEqual(subprocess.run(cmd,capture_output=True).returncode,2);self.assertEqual(before,ledger.read_bytes())
-        key,record=d.lookup(json.loads(ledger.read_text()),'s','task');self.assertEqual(record['authorization_phase'],'audit_only')
+        key,record=d.lookup(json.loads(ledger.read_text(encoding='utf-8')),'s','task');self.assertEqual(record['authorization_phase'],'audit_only')
 
 
 if __name__=='__main__':unittest.main()

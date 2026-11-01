@@ -6,22 +6,26 @@ are used. No chat-history hydration, credential reads or database writes occur.
 """
 import argparse
 import contextlib
-import fcntl
 import hashlib
 import json
 import os
 from pathlib import Path
 import re
-import shlex
-import select
+import queue
+import threading
 import shutil
-import socket
 import sqlite3
 import subprocess
 import sys
-import tempfile
 import time
 import uuid
+
+
+try:
+    from runtime_support import atomic_write, file_lock, private_permissions, shell_command
+except ModuleNotFoundError:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from routing.runtime_support import atomic_write, file_lock, private_permissions, shell_command
 
 DELAY = 5 * 3600 + 2 * 60
 MAX_CHECKPOINT = 16384
@@ -88,8 +92,8 @@ class Store:
         self.root = Path(root).expanduser()
         self.states = self.root / 'states'
         self.states.mkdir(parents=True, exist_ok=True, mode=0o700)
-        os.chmod(self.root, 0o700)
-        os.chmod(self.states, 0o700)
+        private_permissions(self.root, 0o700)
+        private_permissions(self.states, 0o700)
 
     def path(self, sid):
         if not SID.fullmatch(sid):
@@ -99,28 +103,20 @@ class Store:
     @contextlib.contextmanager
     def edit(self, sid):
         path = self.path(sid)
-        with open(str(path) + '.lock', 'a+') as lock:
-            os.chmod(lock.name, 0o600)
-            fcntl.flock(lock, fcntl.LOCK_EX)
-            state = json.loads(path.read_text()) if path.exists() else {}
+        with file_lock(str(path) + '.lock'):
+            state = json.loads(path.read_text(encoding='utf-8')) if path.exists() else {}
             yield state
             raw = json.dumps(state, ensure_ascii=False, sort_keys=True)
-            with tempfile.NamedTemporaryFile('w', dir=self.states, delete=False) as temp:
-                temp.write(raw)
-                name = temp.name
-            os.chmod(name, 0o600)
-            os.replace(name, path)
+            atomic_write(path, raw.encode('utf-8'))
 
     def load(self, sid):
         path = self.path(sid)
-        return json.loads(path.read_text()) if path.exists() else {}
+        return json.loads(path.read_text(encoding='utf-8')) if path.exists() else {}
 
     def notify(self):
-        try:
-            with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as sock:
-                sock.sendto(b'changed', str(self.root / 'notify.sock'))
-        except OSError:
-            pass  # The persistent state is authoritative; the daemon also polls.
+        # The daemon polls authoritative state at most every second. No IPC endpoint,
+        # port, Unix socket path limit or Windows firewall exception is needed.
+        pass
 
 
 def register(store, sid, cwd, started_at):
@@ -201,7 +197,7 @@ def review_primary(store, sid, verdict, summary):
 
 def context(store, sid):
     path = store.path(sid)
-    command = shlex.join([sys.executable, str(Path(__file__).resolve()), '--root', str(store.root.resolve())])
+    command = shell_command([sys.executable, str(Path(__file__).resolve()), '--root', str(store.root.resolve())], for_display=True)
     return (
         'Recovery guard: maintain a compact checkpoint at ' + str(path) + '. '
         'Before long work and at milestones, run ' + command + ' checkpoint --session ' + sid +
@@ -368,7 +364,9 @@ class Rpc:
             env['CODEX_HOME'] = str(Path(codex_home).expanduser().resolve())
         self.proc = subprocess.Popen([codex, 'app-server', '--stdio'], stdin=subprocess.PIPE,
                                      stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env)
-        self.buffer = b''
+        self.responses = queue.Queue(maxsize=256)
+        self.reader = threading.Thread(target=self._read, daemon=True)
+        self.reader.start()
         self.seq = 0
         try:
             self.call('initialize', {'clientInfo': {'name': 'recovery_guard', 'version': '1.0'}, 'capabilities': {'experimentalApi': True}})
@@ -385,23 +383,36 @@ class Rpc:
         self.proc.stdin.flush()
         end = time.monotonic() + 10
         while time.monotonic() < end:
-            if b'\n' not in self.buffer:
-                if not select.select([self.proc.stdout], [], [], max(0, end - time.monotonic()))[0]:
-                    break
-                chunk = os.read(self.proc.stdout.fileno(), 65536)
-                if not chunk:
-                    break
-                self.buffer += chunk
-                continue
-            line, self.buffer = self.buffer.split(b'\n', 1)
-            if not line:
-                continue
-            value = json.loads(line)
+            try:
+                value = self.responses.get(timeout=max(0, end - time.monotonic()))
+            except queue.Empty:
+                break
+            if isinstance(value, Exception):
+                raise value
+            if value is None:
+                raise RuntimeError('Metadata RPC process closed its output')
             if value.get('id') == request_id:
                 if 'error' in value:
                     raise RuntimeError('Metadata RPC failed: ' + method)
                 return value['result']
         raise TimeoutError('Metadata RPC timed out: ' + method)
+
+    def _read(self):
+        try:
+            while True:
+                line = self.proc.stdout.readline(2097153)
+                if not line:
+                    self.responses.put_nowait(None)
+                    return
+                if len(line) > 2097152:
+                    raise ValueError('Metadata RPC response exceeds 2 MiB')
+                if line.strip():
+                    self.responses.put_nowait(json.loads(line))
+        except Exception as error:
+            try:
+                self.responses.put_nowait(error)
+            except queue.Full:
+                pass  # Bounded queue; the waiting caller will still time out.
 
     def close(self):
         self.proc.terminate()
@@ -411,6 +422,7 @@ class Rpc:
             self.proc.kill()
             self.proc.wait(timeout=2)
         self.proc.stdin.close()
+        self.reader.join(timeout=2)
         self.proc.stdout.close()
 
 
@@ -418,7 +430,7 @@ def archived_status(codex_home, sid):
     files = sorted(Path(codex_home).glob('state_*.sqlite'), key=lambda p: p.stat().st_mtime, reverse=True)
     for path in files:
         try:
-            with sqlite3.connect(path.resolve().as_uri() + '?mode=ro', uri=True, timeout=1) as db:
+            with contextlib.closing(sqlite3.connect(path.resolve().as_uri() + '?mode=ro', uri=True, timeout=1)) as db:
                 row = db.execute('SELECT archived FROM threads WHERE id=?', (sid,)).fetchone()
             if row is not None:
                 return bool(row[0])
@@ -517,7 +529,7 @@ def recover_one(store, sid, runtime, now):
     settings_path = store.root / 'settings.json'
     if not settings_path.exists():
         return 'settings_missing'
-    settings = json.loads(settings_path.read_text())
+    settings = json.loads(settings_path.read_text(encoding='utf-8'))
     if not settings.get('enabled') or not runtime.trusted(state['cwd'], settings['hook_command']):
         with store.edit(sid) as live:
             if not same_recovery_view(live, state):
@@ -687,46 +699,39 @@ def run_recovery_check(store, sid, codex, codex_home, now):
 
 
 def daemon(store, codex, codex_home):
-    with open(store.root / 'daemon.lock', 'w') as lock:
-        try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            return
-        path = store.root / 'notify.sock'
-        if path.exists():
-            path.unlink()
-        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as listener:
-            listener.bind(str(path))
-            os.chmod(path, 0o600)
+    try:
+        with file_lock(store.root / 'daemon.lock', timeout=0):
             while True:
-                now = time.time()
-                settings = json.loads((store.root / 'settings.json').read_text())
-                if not settings.get('enabled'):
-                    if select.select([listener], [], [], 60)[0]:
-                        listener.recv(64)
-                    continue
-                due = []
-                for file in store.states.glob('*.json'):
-                    try:
-                        state = json.loads(file.read_text())
-                        if state.get('armed'):
-                            due.append((state['next_check_at'], state['session_id']))
-                    except (ValueError, KeyError, OSError):
-                        continue
-                for when, sid in due:
-                    if when <= now:
-                        result = run_recovery_check(store, sid, codex, codex_home, now)
-                        log_path = store.root / 'events.jsonl'
-                        if log_path.exists() and log_path.stat().st_size > 1024 * 1024:
-                            os.replace(log_path, store.root / 'events.previous.jsonl')
-                        with open(log_path, 'a') as log:
-                            os.chmod(log.name, 0o600)
-                            log.write(json.dumps({'time': now, 'session_id': sid, 'result': result}) + '\n')
-                latest = [store.load(sid) for _, sid in due]
-                future = [state.get('next_check_at', now + 60) for state in latest if state.get('armed')]
-                timeout = max(0.1, min([60] + [x - time.time() for x in future]))
-                if select.select([listener], [], [], timeout)[0]:
-                    listener.recv(64)
+                daemon_tick(store, codex, codex_home)
+                time.sleep(1)
+    except TimeoutError:
+        return  # Another daemon owns the process lock.
+
+
+def daemon_tick(store, codex, codex_home, now=None):
+    """One bounded polling pass, also usable by an external supervisor."""
+    now = time.time() if now is None else now
+    settings = json.loads((store.root / 'settings.json').read_text(encoding='utf-8'))
+    if not settings.get('enabled'):
+        return []
+    results = []
+    for file in store.states.glob('*.json'):
+        try:
+            state = json.loads(file.read_text(encoding='utf-8'))
+            if not state.get('armed') or state['next_check_at'] > now:
+                continue
+            sid = state['session_id']
+        except (ValueError, KeyError, OSError):
+            continue
+        result = run_recovery_check(store, sid, codex, codex_home, now)
+        results.append({'time': now, 'session_id': sid, 'result': result})
+        log_path = store.root / 'events.jsonl'
+        if log_path.exists() and log_path.stat().st_size > 1024 * 1024:
+            os.replace(log_path, store.root / 'events.previous.jsonl')
+        with open(log_path, 'a', encoding='utf-8') as log:
+            private_permissions(log.name)
+            log.write(json.dumps(results[-1]) + '\n')
+    return results
 
 
 def main():
@@ -754,12 +759,12 @@ def main():
             child = None
             archived = None
             if event.get('hook_event_name') == 'SubagentStop' and store.load(event['session_id']):
-                settings = json.loads((store.root / 'settings.json').read_text())
+                settings = json.loads((store.root / 'settings.json').read_text(encoding='utf-8'))
                 rpc = Rpc(settings['codex'], settings['codex_home'])
                 child = rpc.call('thread/read', {'threadId': event['agent_id'], 'includeTurns': False})['thread']
                 child = reviewer_execution(child, event, settings['codex_home'])
             if event.get('hook_event_name') == 'UserPromptSubmit' and event.get('prompt', '').startswith('RECOVERY_RESUME:'):
-                settings = json.loads((store.root / 'settings.json').read_text())
+                settings = json.loads((store.root / 'settings.json').read_text(encoding='utf-8'))
                 archived = archived_status(settings['codex_home'], event['session_id'])
             result = hook(store, event, reviewer_metadata=child, recovery_archived=archived)
         except Exception as exc:
@@ -789,14 +794,14 @@ def main():
         path = Path(args.file)
         if path.stat().st_size > MAX_CHECKPOINT:
             raise ValueError('Checkpoint input exceeds 16 KiB')
-        checkpoint(store, args.session, json.loads(path.read_text()))
+        checkpoint(store, args.session, json.loads(path.read_text(encoding='utf-8')))
     elif args.command == 'review-primary':
         review_primary(store, args.session, args.verdict, args.summary)
     elif args.command == 'status':
-        print(json.dumps(store.load(args.session), ensure_ascii=False, indent=2))
+        print(json.dumps(store.load(args.session), ensure_ascii=True, indent=2))
     elif args.command in {'activate', 'deactivate'}:
         settings_path = store.root / 'settings.json'
-        settings = json.loads(settings_path.read_text())
+        settings = json.loads(settings_path.read_text(encoding='utf-8'))
         settings['enabled'] = False
         if args.command == 'activate':
             runtime = Runtime(settings['codex'], settings['codex_home'])
@@ -804,8 +809,7 @@ def main():
                 settings['enabled'] = runtime.trusted(settings['verification_cwd'], settings['hook_command'])
             finally:
                 runtime.rpc.close()
-        settings_path.write_text(json.dumps(settings, indent=2, ensure_ascii=False) + '\n')
-        os.chmod(settings_path, 0o600)
+        atomic_write(settings_path, (json.dumps(settings, indent=2, ensure_ascii=False) + '\n').encode('utf-8'))
         store.notify()
         reason = 'disabled' if args.command == 'deactivate' else ('trusted' if settings['enabled'] else 'Review and trust all six hooks with /hooks first.')
         print(json.dumps({'enabled': settings['enabled'], 'reason': reason}))

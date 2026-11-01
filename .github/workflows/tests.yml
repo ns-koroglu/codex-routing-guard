@@ -1,6 +1,8 @@
 name: Tests
 on:
   push:
+    branches: [main]
+    tags: ['v*']
   pull_request:
 permissions:
   contents: read
@@ -15,6 +17,10 @@ jobs:
           - os: ubuntu-latest
             python: '3.13'
           - os: macos-latest
+            python: '3.13'
+          - os: windows-latest
+            python: '3.9'
+          - os: windows-latest
             python: '3.13'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 5

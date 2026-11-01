@@ -2,17 +2,16 @@
 """Preview or install the local runtime. No services, account edits or trust bypass."""
 import argparse
 import contextlib
-import fcntl
 import hashlib
 import json
 import os
 from pathlib import Path
-import shlex
 import shutil
 import subprocess
 import sys
-import tempfile
 import uuid
+
+from routing.runtime_support import atomic_write, file_lock, private_permissions, shell_command, windows_dacl, is_link
 
 SOURCE = Path(__file__).resolve().parent
 EVENTS = ('SessionStart', 'UserPromptSubmit', 'SubagentStart', 'SubagentStop', 'Stop', 'Interrupt')
@@ -35,19 +34,7 @@ def recovery_base(data):
 
 
 def atomic(path, data, mode=0o600):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    name = None
-    try:
-        with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as stream:
-            name = stream.name
-            stream.write(data)
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.chmod(name, mode)
-        os.replace(name, path)
-    finally:
-        if name and os.path.exists(name):
-            os.unlink(name)
+    atomic_write(path, data, mode)
 
 
 def target(home, relative):
@@ -58,7 +45,7 @@ def target(home, relative):
     for part in (path, *path.parents):
         if part == home:
             break
-        if part.is_symlink():
+        if is_link(part):
             raise ValueError('Symlink installation target refused: ' + str(part))
     return path
 
@@ -66,8 +53,11 @@ def target(home, relative):
 def state(path):
     if path.exists() and not path.is_file():
         raise ValueError('Expected a regular file: ' + str(path))
-    return {'exists': path.exists(), 'sha256': sha(path.read_bytes()) if path.exists() else None,
-            'mode': path.stat().st_mode & 0o777 if path.exists() else 0o600}
+    value = {'exists': path.exists(), 'sha256': sha(path.read_bytes()) if path.exists() else None,
+             'mode': path.stat().st_mode & 0o777 if path.exists() else 0o600}
+    if os.name == 'nt':
+        value['windowsDacl'] = windows_dacl(path) if path.exists() else None
+    return value
 
 
 def stable_cli(value):
@@ -84,23 +74,25 @@ def stable_cli(value):
 
 def plan(home, recovery=False, codex='codex', verification_cwd=None):
     old_path = target(home, MANIFEST)
-    old = json.loads(old_path.read_text()) if old_path.exists() else {}
+    old = json.loads(old_path.read_text(encoding='utf-8')) if old_path.exists() else {}
     if not isinstance(old, dict) or (old and (old.get('schemaVersion') != 1 or not isinstance(old.get('files'), dict))):
         raise ValueError('Unrecognized existing installer manifest')
     updates = {}
-    for name in ('dispatch.py', 'POLICY.md', 'README.md', 'execution-prompt.txt'):
+    for name in ('dispatch.py', 'runtime_support.py', 'skill_supply.py', 'POLICY.md', 'README.md', 'execution-prompt.txt'):
         updates['routing/' + name] = (SOURCE / 'routing' / name).read_bytes()
-    for name in ('SKILL.md', 'agents/openai.yaml', 'scripts/routing.py', 'references/runtime.md'):
+    for name in ('SKILL.md', 'agents/openai.yaml', 'scripts/routing.py', 'references/runtime.md', 'references/skill-discovery.md'):
         updates['skills/route-tasks/' + name] = (SOURCE / 'skills/route-tasks' / name).read_bytes()
     hook_command = old.get('hookCommand')
     settings_base = old.get('recoverySettingsBaseSha256')
     if recovery:
         executable = stable_cli(codex)
         code = (SOURCE / 'recovery/guard.py').read_bytes()
-        script = home / 'recovery-guard/bin' / ('guard-' + sha(code)[:20] + '.py')
-        hook_command = shlex.join([sys.executable, str(script), '--root', str(home / 'recovery-guard'), 'hook'])
+        support = (SOURCE / 'routing/runtime_support.py').read_bytes()
+        bundle = home / 'recovery-guard/bin' / ('guard-' + sha(code + support)[:20])
+        script = bundle / 'guard.py'
+        hook_command = shell_command([sys.executable, str(script), '--root', str(home / 'recovery-guard'), 'hook'])
         hooks_path = target(home, 'hooks.json')
-        hooks = json.loads(hooks_path.read_text()) if hooks_path.exists() else {}
+        hooks = json.loads(hooks_path.read_text(encoding='utf-8')) if hooks_path.exists() else {}
         if not isinstance(hooks, dict) or not isinstance(hooks.get('hooks', {}), dict):
             raise ValueError('Invalid existing hooks.json; no files were changed')
         hooks.setdefault('hooks', {})
@@ -120,7 +112,7 @@ def plan(home, recovery=False, codex='codex', verification_cwd=None):
             groups.append({'hooks': [{'type': 'command', 'command': hook_command}]})
         settings = {'enabled': False, 'codex': executable, 'codex_home': str(home),
                     'hook_command': hook_command, 'verification_cwd': str(Path(verification_cwd or Path.cwd()).resolve()),
-                    'installed_script': str(script), 'script_sha256': sha(code)}
+                    'installed_script': str(script), 'script_sha256': sha(code), 'runtime_sha256': sha(support)}
         settings_path = target(home, 'recovery-guard/settings.json')
         if 'recovery-guard/settings.json' in old.get('files', {}) and settings_path.is_file():
             current_settings = settings_path.read_bytes()
@@ -128,6 +120,7 @@ def plan(home, recovery=False, codex='codex', verification_cwd=None):
                 settings['enabled'] = json.loads(current_settings)['enabled']
         settings_base = sha(recovery_base(encoded(settings)))
         updates.update({'hooks.json': encoded(hooks), str(script.relative_to(home)): code,
+                        str((bundle / 'runtime_support.py').relative_to(home)): support,
                         'recovery-guard/settings.json': encoded(settings),
                         'recovery-guard/installation.json': encoded({
                             'root': str(home / 'recovery-guard'), 'script': str(script), 'python': sys.executable,
@@ -161,9 +154,7 @@ def verify(home, baseline):
 def locked(home):
     home.mkdir(parents=True, exist_ok=True)
     path = target(home, '.routing-guard-install.lock')
-    with path.open('a') as stream:
-        os.chmod(path, 0o600)
-        fcntl.flock(stream, fcntl.LOCK_EX)
+    with file_lock(path):
         yield
 
 
@@ -172,6 +163,7 @@ def apply(home, updates, baseline):
     backup = home / 'routing-guard-backups' / uuid.uuid4().hex
     target(home, str(backup.relative_to(home)) + '/restore.json')
     backup.mkdir(parents=True, mode=0o700)
+    private_permissions(backup, 0o700)
     records = {}
     for index, (name, data) in enumerate(updates.items()):
         before = baseline[name]
@@ -202,6 +194,8 @@ def restore_one(path, backup, item):
         if sha(data) != item['sha256']:
             raise ValueError('Corrupt backup refused')
         atomic(path, data, item['mode'])
+        if item.get('windowsDacl'):
+            windows_dacl(path, item['windowsDacl'])
     elif path.exists():
         path.unlink()
 
@@ -210,7 +204,7 @@ def rollback(home, backup, apply_changes=False):
     backup = Path(backup).expanduser().resolve()
     if backup.parent != (home / 'routing-guard-backups').resolve():
         raise ValueError('Backup must belong to this Codex home')
-    value = json.loads((backup / 'restore.json').read_text())
+    value = json.loads((backup / 'restore.json').read_text(encoding='utf-8'))
     if value['home'] != str(home):
         raise ValueError('Backup belongs to another Codex home')
     for name, item in value['files'].items():
@@ -240,8 +234,8 @@ def main():
     parser.add_argument('--rollback', type=Path)
     args = parser.parse_args()
     try:
-        if sys.version_info < (3, 9) or os.name != 'posix':
-            raise ValueError('Python3.9+ on macOS/Linux is required')
+        if sys.version_info < (3, 9) or os.name not in {'posix', 'nt'}:
+            raise ValueError('Python 3.9+ on Windows, macOS or Linux is required')
         home = args.codex_home.expanduser().resolve()
         if args.rollback:
             if args.apply:
@@ -260,7 +254,7 @@ def main():
                 result['backup'] = str(apply(home, updates, baseline))
             result['applied'] = True
         print(json.dumps(result, indent=2))
-    except (ValueError, KeyError, TypeError, OSError, subprocess.SubprocessError) as error:
+    except (ValueError, KeyError, TypeError, OSError, TimeoutError, subprocess.SubprocessError) as error:
         parser.exit(2, str(error) + '\n')
 
 
