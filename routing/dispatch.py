@@ -2,16 +2,22 @@
 import argparse
 import copy
 import datetime
-import fcntl
 import hashlib
 import json
 import os
 import re
 from pathlib import Path
 import subprocess
-import tempfile
+import sys
 import time
 import unicodedata
+
+
+try:
+    from runtime_support import atomic_write, file_lock, private_permissions, shell_command
+except ModuleNotFoundError:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from routing.runtime_support import atomic_write, file_lock, private_permissions, shell_command
 
 ROOT = Path(__file__).parent
 TERMINAL = {'completed', 'cancelled'}
@@ -87,7 +93,7 @@ def request_key(source, task_id):
 
 
 def capabilities(path=None, now=None):
-    value = json.loads(Path(path or ROOT/'capabilities.json').read_text())
+    value = json.loads(Path(path or ROOT/'capabilities.json').read_text(encoding='utf-8'))
     if not value.get('source') or not value.get('models') or not value.get('hostId'):
         raise ValueError('Verified host capability snapshot required')
     if not 0 <= (now or time.time())-value.get('observedAt', 0) <= value.get('maxAgeSeconds', 86400):
@@ -412,9 +418,7 @@ def preflight(data, request, projects, catalog, body):
 
 
 def save(path,data):
-    with tempfile.NamedTemporaryFile(mode='w',dir=path.parent,delete=False) as temp:
-        json.dump(data,temp,ensure_ascii=False,indent=2);temp.write('\n');temp.flush();os.fsync(temp.fileno());name=temp.name
-    os.replace(name,path)
+    atomic_write(path, (json.dumps(data, ensure_ascii=False, indent=2) + '\n').encode('utf-8'))
 
 
 def main():
@@ -442,12 +446,12 @@ def main():
         if cmd=='related':p.add_argument('--request-id',required=True);p.add_argument('--intent',required=True);p.add_argument('--request-evidence')
     sub.add_parser('metrics')
     args=parser.parse_args()
-    def read(path):return json.loads(Path(path).read_text())
+    def read(path):return json.loads(Path(path).read_text(encoding='utf-8'))
     try:
         if args.command=='key':print(request_key(args.source,args.task_id));return
         if args.command=='recommend':print(json.dumps(recommend(args.kind,capabilities(args.capabilities),args.model,args.effort)));return
         if args.command=='refresh-capabilities':
-            value=refresh_capabilities(Path(args.metadata).read_text(),args.host,read(args.profiles) if args.profiles else None);save(Path(args.output),value)
+            value=refresh_capabilities(Path(args.metadata).read_text(encoding='utf-8'),args.host,read(args.profiles) if args.profiles else None);save(Path(args.output),value)
             print(json.dumps({'hostId':value['hostId'],'models':list(value['models']),'observedAt':value['observedAt']}));return
         if args.command=='metrics':
             data=read(args.ledger) if args.ledger.exists() else {}
@@ -456,23 +460,22 @@ def main():
             latencies=[r['startedAt']-r['createdAt'] for r in data.values() if r.get('startedAt') and r.get('createdAt')]
             print(json.dumps({'records':len(data),'statuses':counts,'observedDispatchSeconds':latencies,'tokenUsage':None,'note':'No verified turn-scoped token evidence; no savings or price estimate.'}));return
         args.ledger.parent.mkdir(parents=True,exist_ok=True)
-        with args.ledger.with_suffix('.lock').open('a') as lock:
-            fcntl.flock(lock,fcntl.LOCK_EX)
+        with file_lock(args.ledger.with_suffix('.lock')):
             data=read(args.ledger) if args.ledger.exists() else {}
             cmd=args.command
             if cmd=='resolve-project':
                 parents=[r for r in data.values() if r.get('destination')==args.source]
                 if len(parents)>1:raise ValueError('Ambiguous dispatch lineage')
-                print(json.dumps(resolve_project(read(args.projects)['projects'],args.cwd,args.project_id,args.execution_cwd,parents[0] if parents else None,args.source),ensure_ascii=False));return
+                print(json.dumps(resolve_project(read(args.projects)['projects'],args.cwd,args.project_id,args.execution_cwd,parents[0] if parents else None,args.source),ensure_ascii=True));return
             if cmd=='lookup':key,record=lookup(data,args.source,args.task_id) if args.task_id else lookup_request(data,args.source,args.request_id)
             elif cmd=='preflight':
-                result=preflight(data,read(args.request),read(args.projects)['projects'],capabilities(args.capabilities),Path(args.prompt).read_text())
+                result=preflight(data,read(args.request),read(args.projects)['projects'],capabilities(args.capabilities),Path(args.prompt).read_text(encoding='utf-8'))
                 output=Path(args.output)
                 if not output.parent.is_dir():raise ValueError('Output directory must already exist')
                 save(output,result);save(args.ledger,data)
                 print(json.dumps({'key':result['key'],'status':result['status'],'requestFile':str(output.resolve())}));return
             elif cmd=='reserve':
-                key=reserve(data,args.source,args.request_id,args.model,args.effort,read(args.context),Path(args.prompt).read_text(),read(args.projects)['projects'],args.task_id,args.authorization_phase,capabilities(args.capabilities),args.explicit_projectless)
+                key=reserve(data,args.source,args.request_id,args.model,args.effort,read(args.context),Path(args.prompt).read_text(encoding='utf-8'),read(args.projects)['projects'],args.task_id,args.authorization_phase,capabilities(args.capabilities),args.explicit_projectless)
             else:
                 key=args.key;record=data[key]
                 if cmd=='attach':attach(record,args.destination,args.host,args.project_id,data)
@@ -485,8 +488,8 @@ def main():
                 elif cmd=='related':related(record,args.request_id,args.intent,read(args.request_evidence) if args.request_evidence else None)
                 elif cmd=='authorize':authorize(record,read(args.evidence))
             if cmd not in {'get','lookup'}:save(args.ledger,data)
-            print(json.dumps({'key':key,**data[key]},ensure_ascii=False,indent=2))
-    except (ValueError,KeyError,OSError,subprocess.SubprocessError) as error:parser.exit(2,str(error)+'\n')
+            print(json.dumps({'key':key,**data[key]},ensure_ascii=True,indent=2))
+    except (ValueError,KeyError,OSError,TimeoutError,subprocess.SubprocessError) as error:parser.exit(2,str(error)+'\n')
 
 
 if __name__=='__main__':main()

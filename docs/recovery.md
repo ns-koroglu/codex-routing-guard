@@ -10,6 +10,18 @@ Live doctor starts a local metadata app-server and reads subscription limits and
 
 The installed settings identify the exact content-addressed helper, Codex home and CLI path. Read them without guessing the helper hash:
 
+The installed skill adapter provides the same portable entry point on all three operating systems (substitute the actual skill directory; use `python3` on POSIX if needed):
+
+```text
+python <CODEX_HOME>/skills/route-tasks/scripts/routing.py recovery activate
+python <CODEX_HOME>/skills/route-tasks/scripts/routing.py recovery daemon
+python <CODEX_HOME>/skills/route-tasks/scripts/routing.py recovery deactivate
+```
+
+It verifies installed helper/runtime hashes, keeps the selected Codex home and waits for the command's real exit status. The daemon runs in the foreground; stop it with Ctrl-C. It polls persisted state once per second, uses a native single-instance process lock, and requires no Unix socket, port or firewall exception. Both the helper and its shared runtime are content-addressed; a change to either produces new hook definitions and disables automatic recovery until trust is reviewed again.
+
+The following alternative uses POSIX shell heredocs; Windows users should use the adapter above:
+
 ```bash
 python3 - <<'PY'
 import json, os, pathlib, subprocess, sys

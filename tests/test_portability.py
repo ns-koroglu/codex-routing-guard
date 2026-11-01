@@ -1,4 +1,6 @@
 import json
+import base64
+import contextlib
 import os
 from pathlib import Path
 import shlex
@@ -23,7 +25,10 @@ class PortabilityTests(unittest.TestCase):
         store = guard.Store(self.root / 'guard')
         text = guard.context(store, 'example-session')
         command = text.split('run ', 1)[1].split(' checkpoint ', 1)[0]
-        self.assertEqual(shlex.split(command)[-2:], ['--root', str(store.root)])
+        if os.name == 'nt':
+            self.assertIn("'--root' '" + str(store.root) + "'", command)
+        else:
+            self.assertEqual(shlex.split(command)[-2:], ['--root', str(store.root)])
 
     def test_rpc_child_receives_explicit_codex_home(self):
         process = Mock()
@@ -71,11 +76,12 @@ class PortabilityTests(unittest.TestCase):
             dispatch.refresh_capabilities(metadata, 'local', {**profiles, 'routine': 'bad'})
 
     def test_archive_metadata_handles_reserved_characters_in_home(self):
-        home = self.root / 'codex?home#unicode-ı'
+        home = self.root / ('codex home#unicode-ı' if os.name == 'nt' else 'codex?home#unicode-ı')
         home.mkdir(parents=True)
-        with sqlite3.connect(home / 'state_1.sqlite') as db:
+        with contextlib.closing(sqlite3.connect(home / 'state_1.sqlite')) as db:
             db.execute('CREATE TABLE threads (id TEXT, archived INTEGER)')
             db.execute('INSERT INTO threads VALUES (?, ?)', ('example-session', 0))
+            db.commit()
         self.assertIs(guard.archived_status(home, 'example-session'), False)
 
 

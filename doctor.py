@@ -10,14 +10,14 @@ import sys
 
 
 def inspect(home, codex='codex', live=False):
-    checks = {'platformSupported': os.name == 'posix' and sys.version_info >= (3, 9)}
+    checks = {'platformSupported': os.name in {'posix', 'nt'} and sys.version_info >= (3, 9)}
     checks['routingInstalled'] = all((home / 'routing' / p).is_file() for p in ('dispatch.py', 'POLICY.md', 'README.md'))
     checks['skillInstalled'] = (home / 'skills/route-tasks/SKILL.md').is_file()
     result = {'checks': checks, 'liveRequested': live, 'modelWorkEnqueued': False,
               'recovery': {'installed': False, 'enabled': None, 'trusted': 'not_queried'}}
     path = home / 'recovery-guard/settings.json'
     if path.is_file():
-        settings = json.loads(path.read_text())
+        settings = json.loads(path.read_text(encoding='utf-8'))
         if not isinstance(settings, dict) or not isinstance(settings.get('enabled'), bool):
             raise ValueError('Recovery enabled value must be boolean')
         result['recovery'].update(installed=True, enabled=settings['enabled'])
